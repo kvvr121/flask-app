@@ -24,7 +24,7 @@ ecr_repository_name = "flask-app-repo"
 db_instance_class = "db.t3.small"
 db_name = "flaskapp"
 db_username = "flaskuser"
-db_password = "D0Nb3/dRDeD11gemErttxvZbhSyTB33T+CsQpfiqKVw="
+db_password = "YOUR_SECURE_DB_PASSWORD_HERE"
 
 # Domain Configuration
 domain_name = "flask-app.example.com"
@@ -32,4 +32,4 @@ create_dns = false
 
 # Redis Configuration
 redis_node_type = "cache.t3.micro"
-redis_auth_token = "hUJtkn5giCcQqFkvAuGpqwFCDat6neLO6CqM7ewyRCg="
+redis_auth_token = "YOUR_SECURE_REDIS_AUTH_TOKEN_HERE"
