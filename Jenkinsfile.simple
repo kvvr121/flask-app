@@ -1,5 +1,5 @@
 pipeline {
-    agent any
+    agent { label 'k8s-tools' }
 
     environment {
         AWS_DEFAULT_REGION = 'us-west-2'
