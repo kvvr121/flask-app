@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flask-app-staging
+  labels:
+    name: flask-app-staging
+    environment: staging
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flask-app-prod
+  labels:
+    name: flask-app-prod
+    environment: production

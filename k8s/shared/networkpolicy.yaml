@@ -1,0 +1,65 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: flask-app-netpol
+  namespace: flask-app-staging
+spec:
+  podSelector:
+    matchLabels:
+      app: flask-app
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: flask-app-staging
+    - podSelector:
+        matchLabels:
+          app: flask-app
+    ports:
+    - protocol: TCP
+      port: 5001
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: TCP
+      port: 5001
+  egress:
+  - {} # Allow all egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: flask-app-netpol
+  namespace: flask-app-prod
+spec:
+  podSelector:
+    matchLabels:
+      app: flask-app
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: flask-app-prod
+    - podSelector:
+        matchLabels:
+          app: flask-app
+    ports:
+    - protocol: TCP
+      port: 5001
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: TCP
+      port: 5001
+  egress:
+  - {} # Allow all egress

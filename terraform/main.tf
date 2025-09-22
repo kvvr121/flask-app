@@ -1,0 +1,461 @@
+# Main Terraform configuration for Flask App Infrastructure
+terraform {
+  required_version = ">= 1.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.20"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.10"
+    }
+  }
+  
+  backend "s3" {
+    bucket         = "flask-app-terraform-state"
+    key            = "production/terraform.tfstate"
+    region         = "us-west-2"
+    encrypt        = true
+    dynamodb_table = "terraform-locks"
+  }
+}
+
+# Configure AWS Provider
+provider "aws" {
+  region = var.aws_region
+  
+  default_tags {
+    tags = {
+      Project     = "flask-app"
+      Environment = var.environment
+      ManagedBy   = "terraform"
+    }
+  }
+}
+
+# Data sources
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+data "aws_caller_identity" "current" {}
+
+# VPC Module
+module "vpc" {
+  source = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+
+  name = "${var.project_name}-vpc"
+  cidr = var.vpc_cidr
+
+  azs             = slice(data.aws_availability_zones.available.names, 0, 3)
+  private_subnets = var.private_subnet_cidrs
+  public_subnets  = var.public_subnet_cidrs
+  database_subnets = var.database_subnet_cidrs
+
+  enable_nat_gateway     = true
+  single_nat_gateway     = false
+  enable_vpn_gateway     = false
+  enable_dns_hostnames   = true
+  enable_dns_support     = true
+
+  # Enable flow logs
+  enable_flow_log                      = true
+  create_flow_log_cloudwatch_iam_role  = true
+  create_flow_log_cloudwatch_log_group = true
+
+  tags = {
+    Name = "${var.project_name}-vpc"
+  }
+}
+
+# EKS Cluster
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 19.0"
+
+  cluster_name    = var.eks_cluster_name
+  cluster_version = var.kubernetes_version
+
+  vpc_id                         = module.vpc.vpc_id
+  subnet_ids                     = module.vpc.private_subnets
+  cluster_endpoint_public_access = true
+
+  # EKS Managed Node Groups
+  eks_managed_node_groups = {
+    main = {
+      name = "${var.project_name}-node-group"
+
+      instance_types = var.node_instance_types
+      capacity_type  = "ON_DEMAND"
+
+      min_size     = var.node_min_size
+      max_size     = var.node_max_size
+      desired_size = var.node_desired_size
+
+      # Enable detailed monitoring
+      enable_monitoring = true
+
+      # Security groups
+      vpc_security_group_ids = [aws_security_group.node_group_one.id]
+
+      # Launch template
+      launch_template_name        = "${var.project_name}-launch-template"
+      launch_template_description = "Launch template for ${var.project_name}"
+      launch_template_version     = "$Latest"
+
+      # IAM role
+      iam_role_name = "${var.project_name}-node-group-role"
+      iam_role_additional_policies = {
+        AmazonEKSWorkerNodePolicy = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+        AmazonEKS_CNI_Policy = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+        AmazonEC2ContainerRegistryReadOnly = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+        CloudWatchAgentServerPolicy = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+      }
+
+      tags = {
+        Name = "${var.project_name}-node-group"
+      }
+    }
+  }
+
+  # aws-auth configmap (managed manually)
+  manage_aws_auth_configmap = false
+
+  # aws_auth_roles = [
+  #   {
+  #     rolearn  = aws_iam_role.jenkins_role.arn
+  #     username = "jenkins"
+  #     groups   = ["system:masters"]
+  #   },
+  # ]
+
+  tags = {
+    Name = var.eks_cluster_name
+  }
+}
+
+# ECR Repository
+resource "aws_ecr_repository" "flask_app" {
+  name                 = var.ecr_repository_name
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+
+  tags = {
+    Name = "${var.project_name}-ecr"
+  }
+}
+
+# ECR Lifecycle Policy
+resource "aws_ecr_lifecycle_policy" "flask_app" {
+  repository = aws_ecr_repository.flask_app.name
+
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Keep last 30 images"
+        selection = {
+          tagStatus     = "tagged"
+          tagPrefixList = ["v"]
+          countType     = "imageCountMoreThan"
+          countNumber   = 30
+        }
+        action = {
+          type = "expire"
+        }
+      },
+      {
+        rulePriority = 2
+        description  = "Delete untagged images older than 1 day"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 1
+        }
+        action = {
+          type = "expire"
+        }
+      }
+    ]
+  })
+}
+
+# RDS Database
+module "rds" {
+  source = "terraform-aws-modules/rds/aws"
+  version = "~> 6.0"
+
+  identifier = "${var.project_name}-db"
+
+  engine            = "postgres"
+  engine_version    = "15.7"
+  family            = "postgres15"
+  instance_class    = var.db_instance_class
+  allocated_storage = 20
+  storage_encrypted = true
+
+  db_name  = var.db_name
+  username = var.db_username
+  password = var.db_password
+  port     = "5432"
+
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+
+  backup_retention_period = 7
+  backup_window          = "03:00-04:00"
+  maintenance_window     = "Mon:04:00-Mon:05:00"
+
+  skip_final_snapshot = false
+
+  performance_insights_enabled = true
+  monitoring_interval         = 60
+  monitoring_role_arn        = aws_iam_role.rds_monitoring.arn
+
+  tags = {
+    Name = "${var.project_name}-database"
+  }
+}
+
+# Application Load Balancer
+resource "aws_lb" "main" {
+  name               = "${var.project_name}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = module.vpc.public_subnets
+
+  enable_deletion_protection = false
+
+  tags = {
+    Name = "${var.project_name}-alb"
+  }
+}
+
+# ALB Target Group
+resource "aws_lb_target_group" "flask_app" {
+  name     = "${var.project_name}-tg"
+  port     = 5001
+  protocol = "HTTP"
+  vpc_id   = module.vpc.vpc_id
+
+  health_check {
+    enabled             = true
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    timeout             = 5
+    interval            = 30
+    path                = "/health"
+    matcher             = "200"
+    port                = "traffic-port"
+    protocol            = "HTTP"
+  }
+
+  tags = {
+    Name = "${var.project_name}-target-group"
+  }
+}
+
+# ALB Listener (HTTP only for now - SSL requires certificate validation)
+resource "aws_lb_listener" "main" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = "8080"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.flask_app.arn
+  }
+}
+
+# Redirect HTTP to HTTPS (commented out - no SSL certificate)
+# resource "aws_lb_listener" "redirect" {
+#   load_balancer_arn = aws_lb.main.arn
+#   port              = "80"
+#   protocol          = "HTTP"
+
+#   default_action {
+#     type = "redirect"
+#     redirect {
+#       port        = "443"
+#       protocol    = "HTTPS"
+#       status_code = "HTTP_301"
+#     }
+#   }
+# }
+
+# SSL Certificate (commented out - requires DNS validation)
+# resource "aws_acm_certificate" "main" {
+#   domain_name       = var.domain_name
+#   validation_method = "DNS"
+
+#   lifecycle {
+#     create_before_destroy = true
+#   }
+
+#   tags = {
+#     Name = "${var.project_name}-certificate"
+#   }
+# }
+
+# Route53 Zone (if domain is provided)
+resource "aws_route53_zone" "main" {
+  count = var.create_dns ? 1 : 0
+  name  = var.domain_name
+
+  tags = {
+    Name = "${var.project_name}-zone"
+  }
+}
+
+# Route53 Record
+resource "aws_route53_record" "main" {
+  count = var.create_dns ? 1 : 0
+  
+  zone_id = aws_route53_zone.main[0].zone_id
+  name    = var.domain_name
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.main.dns_name
+    zone_id                = aws_lb.main.zone_id
+    evaluate_target_health = true
+  }
+}
+
+# CloudWatch Log Groups
+resource "aws_cloudwatch_log_group" "flask_app" {
+  name              = "/aws/eks/${var.eks_cluster_name}/flask-app"
+  retention_in_days = 30
+
+  tags = {
+    Name = "${var.project_name}-logs"
+  }
+}
+
+# CloudWatch Dashboard
+resource "aws_cloudwatch_dashboard" "main" {
+  dashboard_name = "${var.project_name}-dashboard"
+
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type   = "metric"
+        x      = 0
+        y      = 0
+        width  = 12
+        height = 6
+
+        properties = {
+          metrics = [
+            ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", aws_lb.main.arn_suffix],
+            [".", "TargetResponseTime", ".", "."],
+            [".", "HTTPCode_Target_2XX_Count", ".", "."],
+            [".", "HTTPCode_Target_4XX_Count", ".", "."],
+            [".", "HTTPCode_Target_5XX_Count", ".", "."]
+          ]
+          view    = "timeSeries"
+          stacked = false
+          region  = var.aws_region
+          title   = "Application Load Balancer Metrics"
+          period  = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 6
+        width  = 12
+        height = 6
+
+        properties = {
+          metrics = [
+            ["AWS/EKS", "cluster_failed_request_count", "ClusterName", var.eks_cluster_name],
+            [".", "cluster_status", ".", "."]
+          ]
+          view    = "timeSeries"
+          stacked = false
+          region  = var.aws_region
+          title   = "EKS Cluster Metrics"
+          period  = 300
+        }
+      }
+    ]
+  })
+}
+
+# S3 Bucket for Application Data
+resource "aws_s3_bucket" "app_data" {
+  bucket = "${var.project_name}-app-data-${random_id.bucket_suffix.hex}"
+
+  tags = {
+    Name = "${var.project_name}-app-data"
+  }
+}
+
+resource "random_id" "bucket_suffix" {
+  byte_length = 4
+}
+
+resource "aws_s3_bucket_versioning" "app_data" {
+  bucket = aws_s3_bucket.app_data.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "app_data" {
+  bucket = aws_s3_bucket.app_data.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# ElastiCache Redis Cluster
+resource "aws_elasticache_subnet_group" "main" {
+  name       = "${var.project_name}-cache-subnet"
+  subnet_ids = module.vpc.private_subnets
+}
+
+resource "aws_elasticache_replication_group" "main" {
+  replication_group_id         = "${var.project_name}-redis"
+  description                  = "Redis cluster for Flask app"
+  
+  node_type                    = var.redis_node_type
+  port                         = 6379
+  parameter_group_name         = "default.redis7"
+  
+  num_cache_clusters           = 2
+  
+  subnet_group_name            = aws_elasticache_subnet_group.main.name
+  security_group_ids           = [aws_security_group.redis.id]
+  
+  at_rest_encryption_enabled   = true
+  transit_encryption_enabled   = true
+  auth_token                   = var.redis_auth_token
+  
+  snapshot_retention_limit     = 5
+  snapshot_window             = "03:00-05:00"
+  maintenance_window          = "sun:05:00-sun:07:00"
+  
+  tags = {
+    Name = "${var.project_name}-redis"
+  }
+}
