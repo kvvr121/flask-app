@@ -13,10 +13,10 @@ phases:
     commands:
       - echo Logging in to Amazon ECR...
       - aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 954747465428.dkr.ecr.us-west-2.amazonaws.com
-      - echo Build started on date
+      - echo Build started
       - REPOSITORY_URI=954747465428.dkr.ecr.us-west-2.amazonaws.com/flask-app-repo
       - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
-      - IMAGE_TAG=${COMMIT_HASH:=latest}
+      - IMAGE_TAG=latest
       - echo Image URI: $REPOSITORY_URI:$IMAGE_TAG
       - echo Running unit tests...
       - python -m pytest tests/ --junitxml=pytest-report.xml || true
@@ -30,7 +30,7 @@ phases:
 
   post_build:
     commands:
-      - echo Build completed on date
+      - echo Build completed
       - echo Pushing the Docker images...
       - docker push $REPOSITORY_URI:$IMAGE_TAG
       - docker push $REPOSITORY_URI:latest
@@ -42,7 +42,7 @@ artifacts:
   files:
     - imagedefinitions.json
     - pytest-report.xml
-  name: flask-app-$(date +%Y-%m-%d)
+  name: flask-app-build
 
 cache:
   paths:
