@@ -33,3 +33,9 @@ create_dns = false
 # Redis Configuration
 redis_node_type = "cache.t3.micro"
 redis_auth_token = "YOUR_SECURE_REDIS_AUTH_TOKEN_HERE"
+
+# GitHub Source for full CI/CD pipeline
+github_owner = "<github-owner>"
+github_repo  = "<repo-name>"
+github_branch = "main"
+codestar_connection_arn = "arn:aws:codestar-connections:us-west-2:<account-id>:connection/<connection-id>"

@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flask-app-green
+  namespace: flask-app-prod
+  labels:
+    app: flask-app
+    environment: production
+    version: green
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: flask-app
+      version: green
+  template:
+    metadata:
+      labels:
+        app: flask-app
+        environment: production
+        version: green
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5002"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: flask-app-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+      - name: flask-app
+        image: 954747465428.dkr.ecr.us-west-2.amazonaws.com/flask-app-repo:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 5002
+          name: http
+          protocol: TCP
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: flask-app-secrets
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: flask-app-secrets
+              key: redis-url
+        - name: AWS_REGION
+          value: "us-west-2"
+        - name: S3_BUCKET
+          value: "flask-app-app-data"
+        - name: SENTRY_DSN
+          valueFrom:
+            secretKeyRef:
+              name: flask-app-secrets
+              key: sentry-dsn
+              optional: true
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5002
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 5002
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: tmp-volume
+          mountPath: /tmp
+        - name: app-data
+          mountPath: /app/data
+      volumes:
+      - name: tmp-volume
+        emptyDir: {}
+      - name: app-data
+        emptyDir: {}
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - flask-app
+            topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: node-type
+                operator: In
+                values:
+                - production
+
+

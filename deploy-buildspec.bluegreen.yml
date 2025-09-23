@@ -1,0 +1,78 @@
+version: 0.2
+
+env:
+  variables:
+    CLUSTER_NAME: "flask-app-cluster"
+    AWS_REGION: "us-west-2"
+    NAMESPACE: "flask-app-prod"
+    APP_NAME: "flask-app"
+    ECR_URI: "954747465428.dkr.ecr.us-west-2.amazonaws.com/flask-app-repo"
+    IMAGE_TAG: "latest"
+    HEALTH_URL: "http://flask-app.example.com/health"  # override per env
+    HEALTH_TIMEOUT: "60"  # seconds to wait before rollback
+
+phases:
+  install:
+    commands:
+      - aws --version
+      - |
+        if ! command -v kubectl >/dev/null 2>&1; then
+          curl -sSL -o /usr/local/bin/kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+        fi
+      - kubectl version --client=true
+  pre_build:
+    commands:
+      - aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+      - export IMAGE_URI="$ECR_URI:$IMAGE_TAG"
+      - echo "Using image $IMAGE_URI"
+      - |
+        CURRENT_COLOR=$(kubectl -n "$NAMESPACE" get svc ${APP_NAME}-service -o jsonpath='{.spec.selector.version}')
+        if [ "$CURRENT_COLOR" = "blue" ]; then NEW_COLOR="green"; else NEW_COLOR="blue"; fi
+        echo "Current color: ${CURRENT_COLOR:-none}, deploying new color: $NEW_COLOR"
+        echo "NEW_COLOR=$NEW_COLOR" >> $BASH_ENV
+        echo "CURRENT_COLOR=$CURRENT_COLOR" >> $BASH_ENV
+  build:
+    commands:
+      - source $BASH_ENV
+      - DEPLOYMENT_NAME="${APP_NAME}-$NEW_COLOR"
+      - CONTAINER_NAME="$APP_NAME"
+      - echo "Updating deployment $DEPLOYMENT_NAME in $NAMESPACE"
+      - |
+        if kubectl -n "$NAMESPACE" get deployment "$DEPLOYMENT_NAME" >/dev/null 2>&1; then
+          kubectl -n "$NAMESPACE" set image deployment/"$DEPLOYMENT_NAME" "$CONTAINER_NAME"="$IMAGE_URI"
+        else
+          kubectl -n "$NAMESPACE" create deployment "$DEPLOYMENT_NAME" --image="$IMAGE_URI" --dry-run=client -o yaml \
+          | yq e '.spec.template.spec.containers[0].name = env(CONTAINER_NAME)' - \
+          | yq e '.spec.selector.matchLabels.version = env(NEW_COLOR)' - \
+          | yq e '.spec.template.metadata.labels.version = env(NEW_COLOR)' - \
+          | kubectl apply -f -
+        fi
+      - kubectl -n "$NAMESPACE" rollout status deployment/"$DEPLOYMENT_NAME" --timeout=300s
+      - echo "Switching service selector to $NEW_COLOR"
+      - kubectl -n "$NAMESPACE" patch service ${APP_NAME}-service -p "{\"spec\":{\"selector\":{\"app\":\"$APP_NAME\",\"version\":\"$NEW_COLOR\"}}}"
+      - echo "Verifying new pods are serving traffic"
+      - kubectl -n "$NAMESPACE" get pods -l app="$APP_NAME",version="$NEW_COLOR"
+      - echo "Health check against $HEALTH_URL with timeout ${HEALTH_TIMEOUT}s"
+      - |
+        set +e
+        for i in $(seq 1 ${HEALTH_TIMEOUT}); do
+          if curl -sf "$HEALTH_URL" >/dev/null; then echo "Health OK"; SUCCESS=1; break; fi; sleep 1;
+        done
+        set -e
+        if [ -z "${SUCCESS:-}" ]; then
+          echo "Health check failed. Rolling back service to $CURRENT_COLOR" >&2
+          if [ -n "${CURRENT_COLOR:-}" ]; then
+            kubectl -n "$NAMESPACE" patch service ${APP_NAME}-service -p "{\"spec\":{\"selector\":{\"app\":\"$APP_NAME\",\"version\":\"$CURRENT_COLOR\"}}}"
+          fi
+          echo "Rolling back deployment image using kubectl rollout undo"
+          kubectl -n "$NAMESPACE" rollout undo deployment/"$DEPLOYMENT_NAME"
+          exit 1
+        fi
+
+artifacts:
+  files:
+    - '**/*'
+  discard-paths: yes
+
+

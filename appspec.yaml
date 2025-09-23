@@ -1,0 +1,17 @@
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::EKS::Kubernetes
+      Properties:
+        ClusterName: flask-app-cluster
+        Namespace: flask-app-prod
+        ResourceType: deployment
+        ResourceName: flask-app
+Hooks:
+  BeforeInstall: []
+  AfterInstall: []
+  AfterAllowTestTraffic: []
+  BeforeAllowTraffic: []
+  AfterAllowTraffic: []
+
+

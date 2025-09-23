@@ -1,0 +1,18 @@
+sequenceDiagram
+  participant U as User/Deploy Job
+  participant S as Service (selector)
+  participant B as Deployment: blue
+  participant G as Deployment: green
+  Note over B,G: Both deployments exist
+  U->>G: Update image on idle color
+  G-->>G: Rollout and become Ready
+  U->>S: Patch selector to version=green
+  S->>G: Route traffic to green
+  S->>B: Stop routing to blue
+  U->>S: Health check via endpoint
+  alt Health OK
+    S-->>U: Deploy complete
+  else Health Fail
+    U->>S: Revert selector to previous color
+    U->>G: kubectl rollout undo
+  end

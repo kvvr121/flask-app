@@ -131,3 +131,24 @@ variable "redis_auth_token" {
   type        = string
   sensitive   = true
 }
+
+variable "github_owner" {
+  description = "GitHub repository owner"
+  type        = string
+}
+
+variable "github_repo" {
+  description = "GitHub repository name"
+  type        = string
+}
+
+variable "github_branch" {
+  description = "GitHub branch name"
+  type        = string
+  default     = "main"
+}
+
+variable "codestar_connection_arn" {
+  description = "AWS CodeStar Connections ARN for GitHub (v2)"
+  type        = string
+}

@@ -4,7 +4,7 @@
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-Orchestration-blue?style=flat&logo=kubernetes)](https://kubernetes.io/)
 [![Docker](https://img.shields.io/badge/Docker-Containerization-blue?style=flat&logo=docker)](https://www.docker.com/)
 [![Terraform](https://img.shields.io/badge/Terraform-IaC-purple?style=flat&logo=terraform)](https://www.terraform.io/)
-[![Jenkins](https://img.shields.io/badge/Jenkins-CI/CD-red?style=flat&logo=jenkins)](https://www.jenkins.io/)
+[![CodePipeline](https://img.shields.io/badge/AWS_CodePipeline-CI/CD-red?style=flat&logo=amazon-aws)](https://aws.amazon.com/codepipeline/)
 [![Python](https://img.shields.io/badge/Python-3.11-green?style=flat&logo=python)](https://www.python.org/)
 
 > **A production-ready, enterprise-grade Flask web application with a comprehensive CI/CD pipeline, featuring AWS EKS orchestration, security scanning, monitoring, and automated deployments.**
@@ -92,7 +92,7 @@
 - **Load Balancer**: AWS ALB (Application Load Balancer)
 
 ### **DevOps & Security**
-- **CI/CD**: Jenkins Pipeline
+- **CI/CD**: AWS CodePipeline + CodeBuild + CodeDeploy
 - **Security Scanning**: Trivy, Clair, SonarQube, OWASP ZAP
 - **Secrets Management**: Kubernetes Secrets, AWS Secrets Manager
 - **Monitoring**: CloudWatch, Prometheus, Grafana
@@ -271,138 +271,596 @@ kubectl get pods -n flask-app-staging
 kubectl get pods -n flask-app-prod
 ```
 
-## 🔄 Complete CI/CD Pipeline
+## 🔄 CI/CD with AWS CodePipeline, CodeBuild, and CodeDeploy
 
-### **Jenkins Pipeline Stages**
+This project uses AWS-native CI/CD services to build, test, and deploy the Flask app to AWS ECR and Kubernetes on EKS.
 
-The `Jenkinsfile` defines a comprehensive pipeline with the following stages:
+[Static diagram sources: docs/ci-cd-flow.mmd, docs/bluegreen-sequence.mmd]
 
-#### **1. Code Quality & Security**
-```groovy
-stage('Code Quality & Security') {
-    steps {
-        // SonarQube analysis
-        withSonarQubeEnv('SonarQube') {
-            sh 'sonar-scanner -Dsonar.projectKey=flask-app -Dsonar.sources=.'
-        }
-        
-        // Safety vulnerability check
-        sh 'safety check --json --output safety-report.json'
+### **Pipeline Overview**
+- **Source**: GitHub (or CodeCommit)
+- **Build**: AWS CodeBuild runs tests, builds Docker image, pushes to ECR (see `buildspec.yml`)
+- **Deploy**: 
+  - Option A (recommended for EKS): CodePipeline deploy stage uses a dedicated CodeBuild project to apply Kubernetes manifests and update the image tag.
+  - Option B (advanced): AWS CodeDeploy for EKS Blue/Green with an AppSpec for Kubernetes.
+
+#### CI/CD Flow (Mermaid)
+```mermaid
+flowchart LR
+  A[Source: GitHub/S3] --> B[CodeBuild: Build & Test]
+  B --> C[ECR: Push Image]
+  C --> D[CodeBuild: Deploy to EKS]
+  D -->|kubectl set image| E[Staging/Prod Namespace]
+  D -.->|Blue/Green selector| F[Service Selector Switch]
+  F --> G[Health Check]
+  G -->|OK| H[Complete]
+  G -->|Fail| R[Rollback Selector + Undo]
+```
+
+> Note: To export images locally, install Mermaid CLI and run:
+> `mmdc -i docs/ci-cd-flow.mmd -o docs/ci-cd-flow.svg && mmdc -i docs/bluegreen-sequence.mmd -o docs/bluegreen-sequence.svg`
+
+### **Build Stage (CodeBuild)**
+- Uses the existing `buildspec.yml` to:
+  - Install Python 3.11 and dependencies
+  - Run unit tests (`pytest`) and export `pytest-report.xml`
+  - Build Docker image using `Dockerfile.prod`
+  - Push image to ECR: `954747465428.dkr.ecr.us-west-2.amazonaws.com/flask-app-repo:latest`
+  - Emit `imagedefinitions.json` artifact (for ECS workflows) and test report
+
+Relevant file:
+```yaml
+# buildspec.yml (already in repo)
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - pip install --upgrade pip
+      - pip install -r requirements.txt
+  pre_build:
+    commands:
+      - aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 954747465428.dkr.ecr.us-west-2.amazonaws.com
+      - python -m pytest tests/ --junitxml=pytest-report.xml || true
+  build:
+    commands:
+      - docker build -t flask-app:latest -f Dockerfile.prod .
+      - docker tag flask-app:latest 954747465428.dkr.ecr.us-west-2.amazonaws.com/flask-app-repo:latest
+  post_build:
+    commands:
+      - docker push 954747465428.dkr.ecr.us-west-2.amazonaws.com/flask-app-repo:latest
+      - echo '[{"name":"flask-app","imageUri":"954747465428.dkr.ecr.us-west-2.amazonaws.com/flask-app-repo:latest"}]' > imagedefinitions.json
+artifacts:
+  files:
+    - imagedefinitions.json
+    - pytest-report.xml
+```
+
+### **Deploy Stage to EKS (CodeBuild in CodePipeline)**
+Use a second CodeBuild project with an IAM role that can access EKS and update the deployment. Example deploy `buildspec`:
+
+```yaml
+version: 0.2
+env:
+  variables:
+    CLUSTER_NAME: "flask-app-cluster"
+    AWS_REGION: "us-west-2"
+    NAMESPACE: "flask-app-prod"
+    ECR_IMAGE: "954747465428.dkr.ecr.us-west-2.amazonaws.com/flask-app-repo:latest"
+phases:
+  install:
+    commands:
+      - pip install --upgrade awscli
+  pre_build:
+    commands:
+      - aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+  build:
+    commands:
+      - kubectl set image deployment/flask-app flask-app=$ECR_IMAGE -n $NAMESPACE
+      - kubectl rollout status deployment/flask-app -n $NAMESPACE --timeout=300s
+```
+
+Minimum IAM permissions for the deploy role:
+- `eks:DescribeCluster`, `ecr:GetAuthorizationToken`
+- `sts:AssumeRole` (if using IRSA)
+- Kubernetes RBAC to patch/read the `deployment/flask-app` in target namespace
+
+### **Alternative: CodeDeploy for EKS (Blue/Green)**
+For blue/green on EKS via CodeDeploy, create an AppSpec for Kubernetes and configure CodeDeploy resources and hooks. High-level AppSpec outline:
+
+```yaml
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::EKS::Kubernetes
+      Properties:
+        ClusterName: flask-app-cluster
+        Namespace: flask-app-prod
+        ResourceType: deployment
+        ResourceName: flask-app
+Hooks:
+  BeforeInstall: []
+  AfterInstall: []
+  AfterAllowTestTraffic: []
+  BeforeAllowTraffic: []
+  AfterAllowTraffic: []
+```
+
+Note: Blue/green with EKS via CodeDeploy requires additional setup (CodeDeploy application/deployment group, traffic routing, test hooks). If you prefer simplicity, use the deploy-via-CodeBuild approach above.
+
+### **Blue/Green on EKS via Service Selector (Simple Approach)**
+This approach uses two deployments (`flask-app-blue`, `flask-app-green`) and one service (`flask-app-service`) that selects by `version`. The deploy job flips the service selector after the new color is healthy.
+
+Kubernetes objects must include labels/selectors like:
+```yaml
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: flask-app-service
+  namespace: flask-app-prod
+spec:
+  selector:
+    app: flask-app
+    version: blue   # switched by deploy job to blue/green
+  ports:
+  - port: 80
+    targetPort: 5002
+---
+# Deployments should set labels app=flask-app and version={blue|green}
+```
+
+Use `deploy-buildspec.bluegreen.yml` (root) in a dedicated CodeBuild deploy project to:
+- Update the image of the idle color deployment
+- Wait for rollout to complete
+- Patch the service selector to switch traffic to the new color
+ - Perform an HTTP health check and automatically rollback the service selector and deployment if health fails
+
+Tip: Seed both deployments initially via `k8s/production/deployment.yaml` variants or create the second one using `kubectl` before first blue/green switch.
+
+#### Blue/Green Selector Flow (Mermaid)
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant S as Service (selector)
+  participant B as Deployment: blue
+  participant G as Deployment: green
+
+  Note over B,G: Both deployments exist
+  U->>G: Update image on idle color
+  G-->>G: Rollout and become Ready
+  U->>S: Patch selector to version=green
+  S->>G: Route traffic to green
+  S->>B: Stop routing to blue
+  U->>S: Health check via endpoint
+  alt Health OK
+    S-->>U: Deploy complete
+  else Health Fail
+    U->>S: Revert selector to previous color
+    U->>G: kubectl rollout undo
+  end
+```
+
+> Render locally (optional): `mmdc -i docs/bluegreen-sequence.mmd -o docs/bluegreen-sequence.png`
+
+#### Automatic rollback variables
+- **HEALTH_URL**: URL to check after switching traffic (e.g., staging or prod health endpoint)
+- **HEALTH_TIMEOUT**: Seconds to wait for a successful health response before rolling back
+
+The deploy buildspec will:
+- Switch service to the new color
+- Poll `HEALTH_URL` up to `HEALTH_TIMEOUT` seconds
+- If health fails, switch service back to previous color and `kubectl rollout undo` the new color deployment
+
+### **Setting up CodePipeline (Console or IaC)**
+1. Create an ECR repository `flask-app-repo`.
+2. Create CodeBuild project "flask-app-build" using the repo `buildspec.yml` and attach ECR push permissions.
+3. Create CodeBuild project "flask-app-deploy" using `deploy-buildspec.yml` (in repo root) and grant EKS access.
+4. Create CodePipeline with stages: Source → Build (flask-app-build) → Deploy (flask-app-deploy).
+5. Add test and security scan gates as needed (e.g., Trivy in build phase).
+
+### **Artifacts and Reports**
+- Build artifacts: `imagedefinitions.json`, `pytest-report.xml` (visible in CodeBuild/CodePipeline)
+- Container image: `ECR: flask-app-repo:latest` (or tag per commit/semantic version)
+
+### **Quick CI/CD Trigger & Monitoring (CLI)**
+```bash
+# Trigger the end-to-end pipeline
+aws codepipeline start-pipeline-execution --name flask-app-pipeline
+
+# Port-forward service to view health and metrics locally
+kubectl -n flask-app-prod port-forward svc/flask-app-service 8080:80
+
+# In another terminal
+curl -s http://127.0.0.1:8080/health | jq .
+curl -s http://127.0.0.1:8080/metrics | head -n 30
+```
+
+Prometheus/Grafana: refer to `monitoring/prometheus-values.yaml` and `monitoring/grafana-dashboard.json` for dashboards and metrics configuration.
+
+### **Terraform (IaC) examples for CI/CD**
+
+The following Terraform snippets provision two CodeBuild projects (build and deploy) and a CodePipeline wiring them. Replace placeholders (account IDs, ARNs, repo info) as needed.
+
+```hcl
+provider "aws" {
+  region = "us-west-2"
+}
+
+data "aws_caller_identity" "current" {}
+
+########################
+# IAM Roles for CodeBuild
+########################
+resource "aws_iam_role" "codebuild_build_role" {
+  name               = "flask-app-codebuild-build-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = { Service = "codebuild.amazonaws.com" }
+      Action   = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "codebuild_build_policy" {
+  name = "flask-app-codebuild-build-policy"
+  role = aws_iam_role.codebuild_build_role.id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      { Effect = "Allow", Action = [
+          "ecr:GetAuthorizationToken",
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:CompleteLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:InitiateLayerUpload",
+          "ecr:PutImage",
+          "ecr:BatchGetImage",
+          "ecr:DescribeRepositories"
+        ], Resource = "*" },
+      { Effect = "Allow", Action = [
+          "logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"
+        ], Resource = "*" },
+      { Effect = "Allow", Action = ["s3:GetObject","s3:PutObject","s3:ListBucket"], Resource = "*" }
+    ]
+  })
+}
+
+resource "aws_iam_role" "codebuild_deploy_role" {
+  name               = "flask-app-codebuild-deploy-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = { Service = "codebuild.amazonaws.com" }
+      Action   = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "codebuild_deploy_policy" {
+  name = "flask-app-codebuild-deploy-policy"
+  role = aws_iam_role.codebuild_deploy_role.id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      { Effect = "Allow", Action = ["eks:DescribeCluster"], Resource = "*" },
+      { Effect = "Allow", Action = ["ecr:GetAuthorizationToken"], Resource = "*" },
+      { Effect = "Allow", Action = ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"], Resource = "*" },
+      { Effect = "Allow", Action = ["sts:AssumeRole"], Resource = "*" }
+    ]
+  })
+}
+
+########################
+# CodeBuild Projects
+########################
+resource "aws_codebuild_project" "build" {
+  name         = "flask-app-build"
+  service_role = aws_iam_role.codebuild_build_role.arn
+  artifacts { type = "CODEPIPELINE" }
+  environment {
+    compute_type = "BUILD_GENERAL1_SMALL"
+    image        = "aws/codebuild/standard:7.0"
+    type         = "LINUX_CONTAINER"
+    privileged_mode = true
+  }
+  source {
+    type            = "CODEPIPELINE"
+    buildspec       = "buildspec.yml"
+  }
+}
+
+resource "aws_codebuild_project" "deploy" {
+  name         = "flask-app-deploy"
+  service_role = aws_iam_role.codebuild_deploy_role.arn
+  artifacts { type = "CODEPIPELINE" }
+  environment {
+    compute_type = "BUILD_GENERAL1_SMALL"
+    image        = "aws/codebuild/standard:7.0"
+    type         = "LINUX_CONTAINER"
+    privileged_mode = false
+    environment_variable {
+      name  = "CLUSTER_NAME"
+      value = "flask-app-cluster"
+    }
+    environment_variable {
+      name  = "AWS_REGION"
+      value = "us-west-2"
+    }
+    environment_variable {
+      name  = "NAMESPACE"
+      value = "flask-app-prod"
+    }
+    environment_variable {
+      name  = "ECR_URI"
+      value = "954747465428.dkr.ecr.us-west-2.amazonaws.com/flask-app-repo"
+    }
+    environment_variable {
+      name  = "IMAGE_TAG"
+      value = "latest"
+    }
+    # Optional for blue/green health-based rollback
+    environment_variable {
+      name  = "HEALTH_URL"
+      value = "https://your-domain.example.com/health"
+      type  = "PLAINTEXT"
+    }
+    environment_variable {
+      name  = "HEALTH_TIMEOUT"
+      value = "60"
+      type  = "PLAINTEXT"
+    }
+  }
+  source {
+    type      = "CODEPIPELINE"
+    # Use blue/green buildspec with rollback, or switch to deploy-buildspec.yml for simple rollout
+    buildspec = "deploy-buildspec.bluegreen.yml"
+  }
+}
+
+########################
+# CodePipeline
+########################
+resource "aws_iam_role" "codepipeline_role" {
+  name               = "flask-app-codepipeline-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = { Service = "codepipeline.amazonaws.com" },
+      Action   = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "codepipeline_policy" {
+  name = "flask-app-codepipeline-policy"
+  role = aws_iam_role.codepipeline_role.id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      { Effect = "Allow", Action = ["codebuild:BatchGetBuilds","codebuild:StartBuild"], Resource = "*" },
+      { Effect = "Allow", Action = ["s3:GetObject","s3:PutObject","s3:ListBucket"], Resource = "*" }
+    ]
+  })
+}
+
+resource "aws_s3_bucket" "artifacts" {
+  bucket = "flask-app-codepipeline-artifacts-${data.aws_caller_identity.current.account_id}"
+  force_destroy = true
+}
+
+resource "aws_codepipeline" "pipeline" {
+  name     = "flask-app-pipeline"
+  role_arn = aws_iam_role.codepipeline_role.arn
+
+  artifact_store {
+    type     = "S3"
+    location = aws_s3_bucket.artifacts.bucket
+  }
+
+  stage {
+    name = "Source"
+    action {
+      name             = "Source"
+      category         = "Source"
+      owner            = "ThirdParty"
+      provider         = "GitHub"
+      version          = "1"
+      output_artifacts = ["SourceArtifact"]
+      configuration = {
+        Owner      = "<github-owner>"
+        Repo       = "<repo-name>"
+        Branch     = "main"
+        OAuthToken = "<github-oauth-token>"
+      }
+    }
+  }
+
+  stage {
+    name = "Build"
+    action {
+      name             = "CodeBuild"
+      category         = "Build"
+      owner            = "AWS"
+      provider         = "CodeBuild"
+      input_artifacts  = ["SourceArtifact"]
+      output_artifacts = ["BuildArtifact"]
+      version          = "1"
+      configuration = {
+        ProjectName = aws_codebuild_project.build.name
+      }
+    }
+  }
+
+  stage {
+    name = "Deploy"
+    action {
+      name            = "DeployToEKS"
+      category        = "Build"
+      owner           = "AWS"
+      provider        = "CodeBuild"
+      input_artifacts = ["BuildArtifact"]
+      version         = "1"
+      configuration = {
+        ProjectName = aws_codebuild_project.deploy.name
+      }
+    }
     }
 }
 ```
+### **Minimal IAM policies**
 
-#### **2. Unit Testing**
-```groovy
-stage('Unit Tests') {
-    steps {
-        sh 'python -m pytest tests/ --cov=app --cov-report=xml'
-        publishTestResults testResultsPattern: 'test-results.xml'
-        publishCoverage adapters: [coberturaAdapter('coverage.xml')]
-    }
+Attach these to the respective CodeBuild service roles (adjust ARNs/regions as needed). For EKS updates, also grant Kubernetes RBAC to the service account (via IRSA) that maps to the deploy role.
+
+Build role policy (push to ECR, read repo, write logs):
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": [
+        "ecr:GetAuthorizationToken",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:CompleteLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:InitiateLayerUpload",
+        "ecr:PutImage",
+        "ecr:BatchGetImage",
+        "ecr:DescribeRepositories"
+      ], "Resource": "*" },
+    { "Effect": "Allow", "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ], "Resource": "*" },
+    { "Effect": "Allow", "Action": [
+        "s3:GetObject","s3:PutObject","s3:ListBucket"
+      ], "Resource": "*" }
+  ]
 }
 ```
 
-#### **3. Docker Image Build**
-```groovy
-stage('Build Docker Image') {
-    steps {
-        script {
-            def image = docker.build("flask-app:${env.BUILD_NUMBER}")
-            docker.withRegistry('https://954747465428.dkr.ecr.us-west-2.amazonaws.com', 'ecr:us-west-2:aws-credentials') {
-                image.push("latest")
-            }
-        }
-    }
+Deploy role policy (access EKS cluster and ECR token; kubectl auth via Kubernetes RBAC):
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": [
+        "eks:DescribeCluster"
+      ], "Resource": "*" },
+    { "Effect": "Allow", "Action": [
+        "ecr:GetAuthorizationToken"
+      ], "Resource": "*" },
+    { "Effect": "Allow", "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ], "Resource": "*" },
+    { "Effect": "Allow", "Action": [
+        "sts:AssumeRole"
+      ], "Resource": "*" }
+  ]
 }
 ```
 
-#### **4. Container Security Scanning**
-```groovy
-stage('Container Security Scan') {
-    steps {
-        // Trivy vulnerability scan
-        sh 'trivy image --exit-code 1 --severity HIGH,CRITICAL flask-app:${BUILD_NUMBER}'
-        
-        // Clair vulnerability scan
-        sh 'clair-scanner --ip 172.17.0.1 flask-app:${BUILD_NUMBER}'
-    }
+Kubernetes RBAC example for deploy (bind to a service account mapped to the deploy role using IRSA):
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: flask-app-deployer
+  namespace: flask-app-prod
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get","list","watch","patch","update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: flask-app-deployer-binding
+  namespace: flask-app-prod
+subjects:
+- kind: ServiceAccount
+  name: flask-app-deploy-sa
+  namespace: flask-app-prod
+roleRef:
+  kind: Role
+  name: flask-app-deployer
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### **IRSA: Map deploy IAM role to Kubernetes ServiceAccount**
+
+1) Enable IAM OIDC provider for the EKS cluster (Terraform):
+```hcl
+data "aws_eks_cluster" "this" {
+  name = "flask-app-cluster"
+}
+
+data "aws_eks_cluster_auth" "this" {
+  name = data.aws_eks_cluster.this.name
+}
+
+resource "aws_iam_openid_connect_provider" "eks" {
+  url             = data.aws_eks_cluster.this.identity[0].oidc[0].issuer
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = ["9e99a48a9960b14926bb7f3b02e22da0bfd17d94"]
 }
 ```
 
-#### **5. Staging Deployment**
-```groovy
-stage('Deploy to Staging') {
-    steps {
-        sh 'kubectl set image deployment/flask-app flask-app=954747465428.dkr.ecr.us-west-2.amazonaws.com/flask-app-repo:${BUILD_NUMBER} -n flask-app-staging'
-        sh 'kubectl rollout status deployment/flask-app -n flask-app-staging'
+2) Create an IAM role for deploy with trust to the cluster OIDC and `ServiceAccount` `flask-app-deploy-sa` (Terraform):
+```hcl
+data "aws_iam_policy_document" "deploy_sa_trust" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    effect  = "Allow"
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.eks.arn]
     }
+    condition {
+      test     = "StringEquals"
+      variable = replace(aws_iam_openid_connect_provider.eks.url, "https://", "")..":sub"
+      values   = ["system:serviceaccount:flask-app-prod:flask-app-deploy-sa"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = replace(aws_iam_openid_connect_provider.eks.url, "https://", "")..":aud"
+      values   = ["sts.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "deploy_irsa_role" {
+  name               = "flask-app-deploy-irsa-role"
+  assume_role_policy = data.aws_iam_policy_document.deploy_sa_trust.json
+}
+
+resource "aws_iam_role_policy_attachment" "deploy_irsa_attach" {
+  role       = aws_iam_role.deploy_irsa_role.name
+  policy_arn = aws_iam_role_policy.codebuild_deploy_policy.arn
 }
 ```
 
-#### **6. Integration Testing**
-```groovy
-stage('Integration Tests') {
-    steps {
-        sh 'python -m pytest tests/integration/ --junitxml=integration-test-results.xml'
-        sh 'curl -f http://staging.flask-app.example.com/health'
-    }
-}
+3) Create the annotated `ServiceAccount` in Kubernetes pointing to this IAM role (YAML):
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flask-app-deploy-sa
+  namespace: flask-app-prod
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/flask-app-deploy-irsa-role
 ```
 
-#### **7. Security Testing**
-```groovy
-stage('Security Testing') {
-    steps {
-        // OWASP ZAP security scan
-        sh 'docker run -t owasp/zap2docker-stable zap-baseline.py -t http://staging.flask-app.example.com'
-    }
-}
-```
-
-#### **8. Production Deployment (Blue-Green)**
-```groovy
-stage('Deploy to Production') {
-    steps {
-        script {
-            // Blue-Green deployment strategy
-            def currentColor = sh(script: 'kubectl get service flask-app-service -n flask-app-prod -o jsonpath="{.spec.selector.version}"', returnStdout: true).trim()
-            def newColor = currentColor == 'blue' ? 'green' : 'blue'
-            
-            // Deploy to new color
-            sh "kubectl set image deployment/flask-app-${newColor} flask-app=954747465428.dkr.ecr.us-west-2.amazonaws.com/flask-app-repo:${BUILD_NUMBER} -n flask-app-prod"
-            sh "kubectl rollout status deployment/flask-app-${newColor} -n flask-app-prod"
-            
-            // Switch traffic
-            sh "kubectl patch service flask-app-service -n flask-app-prod -p '{\"spec\":{\"selector\":{\"version\":\"${newColor}\"}}}'"
-        }
-    }
-}
-```
-
-#### **9. Infrastructure Updates**
-```groovy
-stage('Infrastructure Updates') {
-    steps {
-        dir('terraform') {
-            sh 'terraform plan -var-file=production.tfvars'
-            sh 'terraform apply -auto-approve -var-file=production.tfvars'
-        }
-    }
-}
-```
-
-#### **10. Notifications**
-```groovy
-stage('Notifications') {
-    steps {
-        // Slack notification
-        slackSend channel: '#devops',
-                  color: 'good',
-                  message: "✅ Deployment successful! Build ${env.BUILD_NUMBER} deployed to production."
-    }
-}
-```
+With IRSA in place, the deploy CodeBuild job can use `kubectl` against the cluster without storing AWS keys in the cluster. Ensure the CodeBuild deploy project either:
+- Assumes `flask-app-deploy-irsa-role` before calling `kubectl`, or
+- Uses a kubeconfig where the mapped `ServiceAccount` performs the in-cluster ops (for in-cluster runners).
 
 ## 🔒 **Enterprise Security Implementation**
 
@@ -614,7 +1072,9 @@ Flask_app/
 ├── app.py                           # Main Flask application
 ├── requirements.txt                 # Python dependencies
 ├── Dockerfile.prod                  # Production Docker image
-├── Jenkinsfile                      # CI/CD pipeline definition
+├── deploy-buildspec.bluegreen.yml   # CodeBuild deploy spec for blue/green
+├── deploy-buildspec.yml             # CodeBuild deploy spec for EKS
+├── appspec.yaml                     # CodeDeploy AppSpec (EKS Blue/Green scaffold)
 ├── .dockerignore                    # Docker ignore file
 ├── .gitignore                       # Git ignore file
 ├── README.md                        # This documentation
@@ -638,7 +1098,9 @@ Flask_app/
 │   │   ├── service.yaml            # Service manifest
 │   │   └── ingress.yaml            # Ingress manifest
 │   └── production/                 # Production environment
-│       ├── deployment.yaml         # Deployment manifest
+│       ├── deployment.yaml         # Single-deployment manifest (legacy/simple)
+│       ├── deployment-blue.yaml    # Blue Deployment (version: blue)
+│       ├── deployment-green.yaml   # Green Deployment (version: green)
 │       ├── service.yaml            # Service manifest
 │       └── ingress.yaml            # Ingress manifest
 │
@@ -962,3 +1424,31 @@ This project demonstrates expertise in:
 - **GitHub Repository**: [https://github.com/kvvr121/flask-app](https://github.com/kvvr121/flask-app)
 
 **🚀 Ready to deploy your own enterprise-grade application? Star this repo and follow the comprehensive setup guide above!**
+
+---
+
+## 🔒 Public Sharing & Enablement (How to keep this repo safe)
+
+This repository is safe to share publicly: it contains only placeholders and no live credentials.
+
+- Do not commit any secrets (PATs, keys, tokens). Keep `terraform/production.tfvars` values as placeholders when sharing.
+- CI/CD Source options:
+  - Demo-ready (already working): Source → Build via S3 source object (no secrets).
+  - Full end-to-end (private enablement): Use GitHub v2 via CodeStar Connections.
+
+To enable GitHub v2 privately (no secrets in repo):
+1) Create a CodeStar connection (Console → Developer Tools → Connections → GitHub) and copy the Connection ARN.
+2) Grant your IaC principal IAM permissions:
+   - `codestar-connections:PassConnection`
+   - `codestar-connections:UseConnection`
+   on the connection ARN.
+3) Edit `terraform/production.tfvars` locally (do not commit):
+   - `codestar_connection_arn = "arn:aws:codestar-connections:REGION:ACCOUNT_ID:connection/CONNECTION_ID"`
+   - `github_owner = "your-org-or-username"`
+   - `github_repo = "your-repo"`
+   - `github_branch = "main"`
+4) Apply and trigger:
+   - `cd terraform && terraform plan -var-file=production.tfvars -out=tfplan-ci && terraform apply -auto-approve tfplan-ci`
+   - `aws codepipeline start-pipeline-execution --name flask-app-pipeline-full`
+
+Note: If you prefer, you can also keep Deploy out of the pipeline and use the provided `deploy-buildspec.yml`/`deploy-buildspec.bluegreen.yml` in a separate CodeBuild project to perform EKS updates.

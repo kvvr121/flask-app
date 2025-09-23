@@ -1,0 +1,45 @@
+version: 0.2
+
+env:
+  variables:
+    CLUSTER_NAME: "flask-app-cluster"
+    AWS_REGION: "us-west-2"
+    NAMESPACE: "flask-app-prod"
+    DEPLOYMENT_NAME: "flask-app"
+    CONTAINER_NAME: "flask-app"
+    ECR_URI: "954747465428.dkr.ecr.us-west-2.amazonaws.com/flask-app-repo"
+    IMAGE_TAG: "latest"  # Override via CodePipeline variable if desired
+
+phases:
+  install:
+    runtime-versions:
+      docker: 20
+    commands:
+      - echo "Installing/validating CLIs"
+      - aws --version
+      - |
+        if ! command -v kubectl >/dev/null 2>&1; then
+          curl -sSL -o /usr/local/bin/kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+        fi
+      - kubectl version --client=true
+
+  pre_build:
+    commands:
+      - echo "Configuring kubeconfig for $CLUSTER_NAME in $AWS_REGION"
+      - aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+      - export IMAGE_URI="$ECR_URI:$IMAGE_TAG"
+      - echo "Deploying image $IMAGE_URI to namespace $NAMESPACE"
+
+  build:
+    commands:
+      - set -e
+      - kubectl -n "$NAMESPACE" set image deployment/"$DEPLOYMENT_NAME" "$CONTAINER_NAME"="$IMAGE_URI"
+      - kubectl -n "$NAMESPACE" rollout status deployment/"$DEPLOYMENT_NAME" --timeout=300s
+
+artifacts:
+  files:
+    - '**/*'
+  discard-paths: yes
+
+

@@ -1,0 +1,20 @@
+ERROR:__main__:Failed to initialize database pool: connection to server at "localhost" (::1), port 5432 failed: FATAL:  password authentication failed for user "flaskuser"
+
+ERROR:__main__:Failed to initialize Redis: Error 61 connecting to localhost:6379. Connection refused.
+INFO:botocore.credentials:Found credentials in shared credentials file: ~/.aws/credentials
+INFO:__main__:S3 client initialized
+ * Serving Flask app 'app'
+ * Debug mode: off
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5002
+ * Running on http://192.168.1.3:5002
+INFO:werkzeug:[33mPress CTRL+C to quit[0m
+/Users/vishnureddy/Documents/DevOps_Projects/Flask_app/app.py:89: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "timestamp": datetime.utcnow().isoformat(),
+INFO:werkzeug:127.0.0.1 - - [22/Sep/2025 15:44:42] "GET / HTTP/1.1" 200 -
+/Users/vishnureddy/Documents/DevOps_Projects/Flask_app/app.py:115: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "timestamp": datetime.utcnow().isoformat(),
+INFO:werkzeug:127.0.0.1 - - [22/Sep/2025 15:44:44] "[35m[1mGET /health HTTP/1.1[0m" 503 -
+INFO:werkzeug:127.0.0.1 - - [22/Sep/2025 15:45:31] "GET / HTTP/1.1" 200 -
+INFO:werkzeug:127.0.0.1 - - [22/Sep/2025 15:45:31] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -

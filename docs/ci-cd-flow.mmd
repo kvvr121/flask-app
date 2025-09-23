@@ -1,0 +1,9 @@
+flowchart LR
+  A[Source: GitHub/S3] --> B[CodeBuild: Build & Test]
+  B --> C[ECR: Push Image]
+  C --> D[CodeBuild: Deploy to EKS]
+  D -->|kubectl set image| E[Staging/Prod Namespace]
+  D -.->|Blue/Green selector| F[Service Selector Switch]
+  F --> G[Health Check]
+  G -->|OK| H[Complete]
+  G -->|Fail| R[Rollback Selector + Undo]

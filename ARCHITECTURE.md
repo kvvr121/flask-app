@@ -66,23 +66,22 @@
                       │
                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                              🔄 CI/CD PIPELINE (JENKINS)                                       │
+│                              🔄 CI/CD PIPELINE (AWS)                                           │
 │  ┌─────────────────────────────────────────────────────────────────────────────────────────┐   │
-│  │  1. Code Quality & Security    2. Unit Testing       3. Docker Build                  │   │
-│  │     • SonarQube                • pytest              • Multi-stage build              │   │
-│  │     • Safety                   • Coverage reports    • Security scanning              │   │
-│  │     • CodeQL                   • Integration tests   • Trivy + Clair                  │   │
+│  │  1. Code Quality & Security    2. Unit Testing       3. Docker Build (CodeBuild)      │   │
+│  │     • SonarQube (opt.)         • pytest              • Trivy/Clair scanning           │   │
+│  │     • Safety                   • Coverage reports    • Push to ECR                    │   │
 │  │                                                                                         │   │
-│  │  4. Push to ECR           5. Deploy Staging      6. Integration Tests                  │   │
-│  │     • Tag latest            • Blue-Green deploy    • API testing                       │   │
-│  │     • Scan vulnerabilities  • Health checks        • Load testing                      │   │
+│  │  4. Artifacts & Reports    5. Deploy to EKS        6. Integration Tests                │   │
+│  │     • imagedefinitions     • CodePipeline +        • API testing                       │   │
+│  │       + test reports         CodeBuild (kubectl)    • Load testing                      │   │
 │  │                                                                                         │   │
 │  │  7. Security Testing      8. Deploy Production   9. Infrastructure Updates             │   │
-│  │     • OWASP ZAP            • Blue-Green strategy   • Terraform apply                   │   │
-│  │     • DAST scanning        • Traffic switching     • Resource updates                  │   │
+│  │     • OWASP ZAP            • Blue/Green via svc    • Terraform apply                   │   │
+│  │     • DAST scanning          selector + rollback    • Resource updates                  │   │
 │  │                                                                                         │   │
 │  │  10. Notifications & Monitoring                                                         │   │
-│  │      • Slack alerts        • Prometheus metrics    • Grafana dashboards                │   │
+│  │      • SNS/Slack alerts    • Prometheus metrics    • Grafana dashboards                │   │
 │  └─────────────────────────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -201,43 +200,41 @@ DATABASE LAYER:
 
 ## 🔄 CI/CD Pipeline Flow
 
+[Static diagram sources: docs/ci-cd-flow.mmd, docs/bluegreen-sequence.mmd]
+
+```mermaid
+flowchart LR
+  dev[Dev Commit] --> src[Source]
+  src --> build[CodeBuild Build/Test]
+  build --> ecr[ECR Image]
+  ecr --> deploy[CodeBuild Deploy]
+  deploy -->|kubectl| eks[EKS Namespace]
+  deploy -.-> switch[Service Selector Switch]
+  switch --> health[Health Check]
+  health -->|OK| done[Success]
+  health -->|Fail| rb[Rollback Selector + Undo]
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                              🔄 COMPLETE CI/CD PIPELINE                                         │
-└─────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-DEVELOPMENT PHASE:
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   👨‍💻 Dev   │───▶│   📝 Code   │───▶│   🔍 PR     │───▶│   ✅ Review │
-│   Writes    │    │   Commit    │    │   Created   │    │   Approved  │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-       │                   │                   │                   │
-       ▼                   ▼                   ▼                   ▼
+> Render locally: `mmdc -i docs/ci-cd-flow.mmd -o docs/ci-cd-flow.svg`
 
-BUILD & TEST PHASE:
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   🔍 Code   │───▶│   🧪 Unit   │───▶│   🐳 Docker │───▶│   🔒 Security│
-│   Quality   │    │   Tests     │    │   Build     │    │   Scanning  │
-│   Analysis  │    │   & Coverage│    │   & Push    │    │   (SAST)    │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-       │                   │                   │                   │
-       ▼                   ▼                   ▼                   ▼
-
-DEPLOYMENT PHASE:
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   🚀 Deploy │───▶│   🧪 Integration│   🔒 Security │───▶│   🚀 Deploy │
-│   Staging   │    │   Testing   │    │   Testing   │    │   Production│
-│             │    │             │    │   (DAST)    │    │   (Blue-Green)│
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-       │                   │                   │                   │
-       ▼                   ▼                   ▼                   ▼
-
-MONITORING PHASE:
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   📊 Metrics│───▶│   📈 Health │───▶│   🔔 Alert  │───▶│   📱 Slack  │
-│   Collection│    │   Checks    │    │   Manager   │    │   Notification│
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+### Blue/Green Selector Flow
+```mermaid
+sequenceDiagram
+  participant S as Service
+  participant B as Blue
+  participant G as Green
+  Note over B,G: Both deployments exist and are healthy
+  G-->>G: Update image + rollout
+  S->>G: Switch to version=green
+  alt Health OK
+    S-->>S: Keep green
+  else Health Fail
+    S-->>B: Revert to blue
+    G-->>G: Rollout undo
+  end
 ```
+
+> Render locally: `mmdc -i docs/bluegreen-sequence.mmd -o docs/bluegreen-sequence.svg`
 
 ## 🎯 Key Features & Benefits
 
@@ -285,7 +282,7 @@ MONITORING PHASE:
 | **Cache** | Redis (ElastiCache) | Session & Data Caching |
 | **Storage** | AWS S3 | File Storage |
 | **Load Balancer** | AWS ALB | Traffic Distribution |
-| **CI/CD** | Jenkins | Automation Pipeline |
+| **CI/CD** | AWS CodePipeline, CodeBuild, CodeDeploy | Automation Pipeline |
 | **Monitoring** | Prometheus, Grafana | Metrics & Visualization |
 | **Security** | Trivy, SonarQube, OWASP ZAP | Vulnerability Scanning |
 | **Cloud** | AWS | Cloud Provider |
