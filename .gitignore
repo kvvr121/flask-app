@@ -82,3 +82,7 @@ kubeconfig*
 # AWS
 .aws/
 aws-credentials
+
+terraform/*.tfplan*
+
+app.out
